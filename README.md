@@ -10,6 +10,10 @@ A tiny, **LLM-inspired language model** that runs entirely in your browser from 
 This project is designed as a **teaching / demo tool** to explain how language models learn from data and make predictions.
 
 ---
+To view the demo, click on below link 
+https://telangdilip.github.io/Tech-for-Non-Tech---Toy-LLM-in-the-Browser-by-Dilip-Telang/
+
+🔐 Get the source code
 
 ## Get the code
 
