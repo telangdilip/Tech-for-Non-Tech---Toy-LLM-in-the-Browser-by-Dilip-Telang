@@ -1,0 +1,396 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Toy LLM, a demo by Dilip Telang</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; max-width: 900px; }
+    pre { background: #f5f5f5; padding: 10px; border-radius: 5px; white-space: pre-wrap; }
+    textarea, input[type="text"] {
+      width: 100%; padding: 8px; margin: 6px 0; font-family: inherit;
+    }
+    button { padding: 8px 16px; margin-top: 6px; cursor: pointer; }
+    .section-title { margin-top: 24px; margin-bottom: 4px; font-weight: bold; }
+    .small { font-size: 0.9em; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Toy LLM, a demo by Dilip Telang</h1>
+  <p>
+    This page trains a tiny "language model" using just a few Humpty-style sentences.
+    It learns to predict the <strong>next word</strong> from the last 3 words, and it can also
+    fill in blanks <code>____</code> inside a sentence by matching against its training data.
+  </p>
+
+  <div class="section-title">Training sentences (our tiny internet):</div>
+  <pre id="sentencesBox"></pre>
+
+  <div class="section-title">Training log:</div>
+  <pre id="logBox"></pre>
+
+  <div class="section-title">Try it:</div>
+  <p class="small">
+    <strong>Next-word mode (uses learned weights):</strong><br>
+    Type a phrase that ends with a context from the training, e.g.:<br>
+    <code>humpty dumpty sat on a</code><br>
+    <code>he went to the</code><br>
+    <code>she played with the</code><br>
+    <code>he bounced the</code><br>
+    <code>the tree was very</code><br>
+    <code>he received a</code><br><br>
+
+    <strong>Fill-in-the-blank mode:</strong><br>
+    Include <code>____</code> anywhere inside, e.g.:<br>
+    <code>humpty ____ sat on a wall</code><br>
+    <code>____ received a call</code><br>
+    <code>the ____ was very tall</code>
+  </p>
+  <input id="queryInput" type="text"
+         placeholder="Type a phrase here (e.g. humpty dumpty sat on a  OR  humpty ____ sat on a wall)">
+  <button id="predictBtn">Ask model</button>
+
+  <div class="section-title">Prediction result:</div>
+  <pre id="resultBox"></pre>
+
+  <script>
+    // ================================
+    // 1. Training data
+    // ================================
+    const sentences = [
+      "humpty dumpty sat on a wall",
+      "he went to the mall",
+      "she played with the doll",
+      "he bounced the ball",
+      "the tree was very tall",
+      "he received a call",
+    ];
+
+    document.getElementById("sentencesBox").textContent = sentences.join("\n");
+
+    // ================================
+    // 2. Build vocabulary (word -> id)
+    // ================================
+    const allText = sentences.join(" ").toLowerCase();
+    const allWords = allText.split(/\s+/);
+    const vocabSet = new Set(allWords);
+    const vocab = Array.from(vocabSet).sort();
+    const vocabSize = vocab.length;
+
+    const wordToIdx = {};
+    const idxToWord = {};
+    vocab.forEach((w, i) => {
+      wordToIdx[w] = i;
+      idxToWord[i] = w;
+    });
+
+    const contextLen = 3; // last 3 words as context
+
+    // ================================
+    // 3. Build training examples
+    //    context (3 words) -> target (next word)
+    // ================================
+    const contexts = []; // each: [id, id, id]
+    const targets = [];  // each: target word id
+    const contextToTarget = {}; // for explanation
+
+    sentences.forEach(sent => {
+      const words = sent.toLowerCase().split(/\s+/);
+      if (words.length <= contextLen) return;
+      const targetWord = words[words.length - 1];
+      const contextWords = words.slice(words.length - 1 - contextLen, words.length - 1);
+      const ctxIds = contextWords.map(w => wordToIdx[w]);
+      const tgtIdx = wordToIdx[targetWord];
+      contexts.push(ctxIds);
+      targets.push(tgtIdx);
+      contextToTarget[contextWords.join(" ")] = targetWord;
+    });
+
+    // Pre-tokenized sentences for blank alignment
+    const trainTokenLists = sentences.map(s =>
+      s.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/)
+    );
+
+    // Show vocab + training examples in log
+    const logBox = document.getElementById("logBox");
+    logBox.textContent = "";
+    logBox.textContent += "Vocabulary (word -> id):\n";
+    vocab.forEach((w, i) => {
+      logBox.textContent += `  ${w.padEnd(10)} -> ${i}\n`;
+    });
+    logBox.textContent += `\nVocab size: ${vocabSize}\n\nTraining examples (context -> target):\n`;
+    contexts.forEach((ctxIds, idx) => {
+      const ctxWords = ctxIds.map(id => idxToWord[id]);
+      const tgt = idxToWord[targets[idx]];
+      logBox.textContent += `  ${ctxWords.join(" ")} -> ${tgt}\n`;
+    });
+    logBox.textContent += "\nStarting training...\n";
+
+    // ================================
+    // 4. Helper functions
+    // ================================
+    function encodeContext(ctxIds) {
+      const x = new Array(vocabSize * contextLen).fill(0);
+      for (let pos = 0; pos < contextLen; pos++) {
+        const wId = ctxIds[pos];
+        const index = pos * vocabSize + wId;
+        x[index] = 1;
+      }
+      return x;
+    }
+
+    function softmax(logits) {
+      const maxLogit = Math.max(...logits);
+      const exps = logits.map(v => Math.exp(v - maxLogit));
+      const sum = exps.reduce((a, b) => a + b, 0);
+      return exps.map(v => v / sum);
+    }
+
+    // ================================
+    // 5. Tiny model: linear layer + softmax
+    //    logits = x * W + b
+    // ================================
+    const inputDim = vocabSize * contextLen;
+    
+    const W = []; // shape: [inputDim][vocabSize]
+    const b = new Array(vocabSize).fill(0);
+
+    // Initialize weights small random
+    for (let i = 0; i < inputDim; i++) {
+      const row = new Array(vocabSize);
+      for (let j = 0; j < vocabSize; j++) {
+        row[j] = (Math.random() - 0.5) * 0.02;
+      }
+      W.push(row);
+    }
+
+    const learningRate = 0.1;
+    const numEpochs = 2000;
+
+    function forward(x) {
+      const logits = new Array(vocabSize).fill(0);
+      for (let j = 0; j < vocabSize; j++) {
+        let sum = b[j];
+        for (let i = 0; i < inputDim; i++) {
+          sum += x[i] * W[i][j];
+        }
+        logits[j] = sum;
+      }
+      return logits;
+    }
+
+    function trainModel() {
+      const numSamples = contexts.length;
+      for (let epoch = 1; epoch <= numEpochs; epoch++) {
+        let totalLoss = 0;
+
+        for (let n = 0; n < numSamples; n++) {
+          const ctxIds = contexts[n];
+          const tgtIdx = targets[n];
+
+          const x = encodeContext(ctxIds);
+          const logits = forward(x);
+          const probs = softmax(logits);
+
+          const loss = -Math.log(probs[tgtIdx] + 1e-9);
+          totalLoss += loss;
+
+          const dlogits = probs.map((p, j) => p - (j === tgtIdx ? 1 : 0));
+
+          for (let j = 0; j < vocabSize; j++) {
+            b[j] -= learningRate * dlogits[j];
+            for (let i = 0; i < inputDim; i++) {
+              W[i][j] -= learningRate * dlogits[j] * x[i];
+            }
+          }
+        }
+
+        if (epoch === 1 || epoch % 500 === 0 || epoch === numEpochs) {
+          const avgLoss = totalLoss / numSamples;
+          logBox.textContent += `Epoch ${epoch}/${numEpochs}, loss = ${avgLoss.toFixed(4)}\n`;
+        }
+      }
+      logBox.textContent += "\nTraining complete.\n";
+    }
+
+    trainModel();
+
+    // ================================
+    // 6. Next-word prediction mode
+    // ================================
+    function predictNextWordFromPhrase(phrase) {
+      const resultBox = document.getElementById("resultBox");
+      let text = phrase.trim().toLowerCase();
+      text = text.replace(/[?!\.]+$/g, "");
+      const tokens = text.split(/\s+/);
+
+      if (tokens.length < contextLen) {
+        resultBox.textContent = `Please provide at least ${contextLen} words.`;
+        return;
+      }
+
+      // if ends with blank, use words before blank as context
+      let contextWords;
+      if (tokens[tokens.length - 1] === "____") {
+        if (tokens.length < contextLen + 1) {
+          resultBox.textContent = `For a trailing blank, please give at least ${contextLen} words before '____'.`;
+          return;
+        }
+        contextWords = tokens.slice(tokens.length - 1 - contextLen, tokens.length - 1);
+      } else {
+        contextWords = tokens.slice(tokens.length - contextLen);
+      }
+
+      const ctxIds = [];
+      for (const w of contextWords) {
+        if (!(w in wordToIdx)) {
+          resultBox.textContent = `Unknown word in context: '${w}'. Known words: ${vocab.join(", ")}`;
+          return;
+        }
+        ctxIds.push(wordToIdx[w]);
+      }
+
+      const x = encodeContext(ctxIds);
+      const logits = forward(x);
+      const probs = softmax(logits);
+
+      const indices = Array.from({ length: vocabSize }, (_, i) => i);
+      indices.sort((a, b) => probs[b] - probs[a]);
+      const topK = indices.slice(0, 5);
+
+      let out = "";
+      out += `Context words used: ${contextWords.join(" ")}\n\n`;
+      out += "Top 5 predicted next words:\n";
+      topK.forEach(i => {
+        out += `  ${idxToWord[i].padEnd(10)} prob = ${probs[i].toFixed(3)}\n`;
+      });
+      const bestIdx = topK[0];
+      const bestWord = idxToWord[bestIdx];
+      out += `\nModel's best guess for the next word: '${bestWord}'\n`;
+
+      // Explanation using training patterns
+      const ctxKey = contextWords.join(" ");
+      out += "\nExplanation:\n";
+      if (contextToTarget[ctxKey]) {
+        const gold = contextToTarget[ctxKey];
+        out += `- In my training sentences, the words "${ctxKey}" were followed by "${gold}".\n`;
+        out += `- I adjusted my weights so that this pattern gets a higher score than others.\n`;
+        out += `- For your input, I used the same context and predicted "${bestWord}".\n`;
+      } else {
+        out += "- I have not seen this exact context in training.\n";
+        out += "- I used what I learned from similar contexts to guess the most likely next word.\n";
+      }
+
+      resultBox.textContent = out;
+    }
+
+    // ================================
+    // 7. Fill-in-the-blank alignment mode
+    // ================================
+    function fillBlanksByAlignment(question) {
+      const resultBox = document.getElementById("resultBox");
+      let q = question.trim().toLowerCase();
+      q = q.replace(/[?!\.]+$/g, "");
+      if (!q.includes("____")) {
+        resultBox.textContent = "Please include '____' as a blank.";
+        return;
+      }
+      const qTokens = q.split(/\s+/);
+
+      let bestScore = -1;
+      let bestIdx = null;
+
+      for (let i = 0; i < trainTokenLists.length; i++) {
+        const sentTokens = trainTokenLists[i];
+        if (sentTokens.length !== qTokens.length) continue;
+        let score = 0;
+        for (let k = 0; k < qTokens.length; k++) {
+          const qt = qTokens[k];
+          const st = sentTokens[k];
+          if (qt !== "____" && qt === st) score++;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+
+      if (bestIdx === null || bestScore <= 0) {
+        resultBox.textContent = "Could not align your question with any known sentence.";
+        return;
+      }
+
+      const matched = trainTokenLists[bestIdx];
+      const filled = [];
+      const blanksAndAnswers = [];
+      for (let k = 0; k < qTokens.length; k++) {
+        const qt = qTokens[k];
+        const st = matched[k];
+        if (qt === "____") {
+          filled.push(st);
+          blanksAndAnswers.push(st);
+        } else {
+          filled.push(qt);
+        }
+      }
+
+      const matchedWords = [];
+      for (let k = 0; k < qTokens.length; k++) {
+        const qt = qTokens[k];
+        const st = matched[k];
+        if (qt !== "____" && qt === st) matchedWords.push(qt);
+      }
+
+      let out = "";
+      out += `Matched training sentence: ${matched.join(" ")}\n`;
+      out += `Match score (same non-blank words): ${bestScore}\n\n`;
+      out += "Filled sentence:\n";
+      out += "  " + filled.join(" ") + "\n";
+      if (blanksAndAnswers.length) {
+        out += `\nPredicted blank(s): ${blanksAndAnswers.join(", ")}\n`;
+      }
+
+      out += "\nExplanation:\n";
+      if (matchedWords.length) {
+        out += "- I compared your sentence to my known sentences.\n";
+        out += `- The best match was "${matched.join(" ")}" because these words matched: ${matchedWords.join(", ")}.\n`;
+        out += `- At the blank position, that sentence has "${blanksAndAnswers[0]}", so I filled it in.\n`;
+      } else {
+        out += "- I chose the sentence that shared the most words with your question and copied the word(s) from that position.\n";
+      }
+
+      resultBox.textContent = out;
+    }
+
+    // ================================
+    // 8. Decide which mode to use
+    // ================================
+    function answerQuestion(phrase) {
+      const resultBox = document.getElementById("resultBox");
+      const raw = phrase.trim();
+      if (!raw) {
+        resultBox.textContent = "Please type something first.";
+        return;
+      }
+
+      if (raw.includes("____")) {
+        // If the blank is the last token -> next-word mode
+        let tmp = raw.toLowerCase().replace(/[?!\.]+$/g, "");
+        const tokens = tmp.split(/\s+/);
+        if (tokens[tokens.length - 1] === "____") {
+          predictNextWordFromPhrase(raw);
+        } else {
+          fillBlanksByAlignment(raw);
+        }
+      } else {
+        // No blank -> use next-word prediction from last 3 words
+        predictNextWordFromPhrase(raw);
+      }
+    }
+
+    document.getElementById("predictBtn").addEventListener("click", () => {
+      const q = document.getElementById("queryInput").value;
+      answerQuestion(q);
+    });
+  </script>
+</body>
+</html>
